@@ -233,16 +233,44 @@ function parseCard(card, validYYYY = 4) {
 async function sendMessage(chatId, text, markdown = false) {
     try {
         const url = `${API_URL}sendMessage`;
-        await axios.get(url, {
+        const res = await axios.get(url, {
             params: {
                 chat_id: chatId,
                 text: text,
                 parse_mode: markdown ? 'Markdown' : undefined
             }
         });
+        return res.data?.result?.message_id ?? null;
     } catch (error) {
         console.error('Error sending message:', error.message);
+        return null;
     }
+}
+
+/** Edit an existing message (same chat). Falls back to sendMessage if edit fails. */
+async function editMessageText(chatId, messageId, text, markdown = false) {
+    if (messageId == null) return false;
+    try {
+        const res = await axios.get(`${API_URL}editMessageText`, {
+            params: {
+                chat_id: chatId,
+                message_id: messageId,
+                text: text,
+                parse_mode: markdown ? 'Markdown' : undefined
+            }
+        });
+        return res.data?.ok === true;
+    } catch (error) {
+        console.error('Error editing message:', error.message);
+        return false;
+    }
+}
+
+async function replyOrEdit(chatId, messageId, text, markdown = false) {
+    if (messageId != null && (await editMessageText(chatId, messageId, text, markdown))) {
+        return messageId;
+    }
+    return sendMessage(chatId, text, markdown);
 }
 
 async function forwardersd(message, chatId) {
@@ -470,11 +498,12 @@ app.post('/', async (req, res) => {
     }
 });
 
-async function processCard(chatId, cardText) {
+async function processCard(chatId, cardText, massOpts = null) {
     // Do not clear cancel flag here — mass check must see /stop; single/mass runners set false when starting
     const cookie = randomString(10);
     const sessionId = `session_${chatId}_${Date.now()}`;
-    
+    let statusMessageId = null;
+
     sessions[sessionId] = {
         useragent: userAgent.generate()
     };
@@ -535,8 +564,11 @@ async function processCard(chatId, cardText) {
         const totalAmount = (quantity * pricePerQuantity).toFixed(2);
         
         console.log(`Processing card with quantity: ${quantity}, amount: $${totalAmount}`);
-        
-        await sendMessage(chatId, `⏳ Checking: \`${cardText}\`\n💰 Amount: $${totalAmount} (${quantity} × $${pricePerQuantity.toFixed(2)})\n\nPlease wait...`, true);
+
+        const processingText = massOpts && massOpts.massTotal > 1
+            ? `⏳ *Processing cards...*\n\n${massOpts.massIndex}/${massOpts.massTotal}\n\nPlease wait...`
+            : `⏳ *Processing card...*\n\nPlease wait...`;
+        statusMessageId = await sendMessage(chatId, processingText, true);
 
         let retry = 0;
         let result = null;
@@ -546,11 +578,11 @@ async function processCard(chatId, cardText) {
             if (cancelFlags[chatId]) {
                 removeCookie(cookie);
                 delete sessions[sessionId];
-                await sendMessage(chatId, "🛑 *Cancelled*\n\n💳 `" + cardText + "`\n\nCard check cancelled by user.", true);
+                await replyOrEdit(chatId, statusMessageId, "🛑 *Cancelled*\n\n💳 `" + cardText + "`\n\nCard check cancelled by user.", true);
                 delete cancelFlags[chatId];
                 return;
             }
-            
+
             try {
                 // Step 1: Create Order
                 const order = await makeRequest(
@@ -690,11 +722,11 @@ async function processCard(chatId, cardText) {
                     // Check for cancellation after wait
                     if (cancelFlags[chatId]) {
                         delete sessions[sessionId];
-                        await sendMessage(chatId, "🛑 *Cancelled*\n\n💳 `" + cardText + "`\n\nCard check cancelled by user.", true);
+                        await replyOrEdit(chatId, statusMessageId, "🛑 *Cancelled*\n\n💳 `" + cardText + "`\n\nCard check cancelled by user.", true);
                         delete cancelFlags[chatId];
                         return;
                     }
-                    
+
                     continue;
                 }
 
@@ -779,7 +811,7 @@ async function processCard(chatId, cardText) {
         // Do not delete cancelFlags here — mass check must see /stop between cards
 
         if (result) {
-            await sendMessage(chatId, result.message, true);
+            await replyOrEdit(chatId, statusMessageId, result.message, true);
         }
 
     } catch (error) {
@@ -787,7 +819,7 @@ async function processCard(chatId, cardText) {
         removeCookie(cookie);
         delete sessions[sessionId];
         // Do not delete cancelFlags here — mass check must see /stop between cards
-        await sendMessage(chatId, `⚠️ *ERROR*\n\n💳 \`${cardText}\`\n\n📝 *Error:*\n${error.message}`, true);
+        await replyOrEdit(chatId, statusMessageId, `⚠️ *ERROR*\n\n💳 \`${cardText}\`\n\n📝 *Error:*\n${error.message}`, true);
     }
 }
 
@@ -807,7 +839,7 @@ async function processMassCards(chatId, cardLines) {
             return;
         }
 
-        await processCard(chatId, cardLines[i]);
+        await processCard(chatId, cardLines[i], { massIndex: i + 1, massTotal: total });
 
         // Short delay between cards to avoid rate limits
         if (i < cardLines.length - 1) {
